@@ -20,7 +20,7 @@ import math
 import logging
 import types
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Callable
 
 import torch
 import torch.nn.functional as F
@@ -337,9 +337,38 @@ def _make_patched_mla_forward(orig_fn, state: LayerState):
 # Public API
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Bit Profiling Presets
+# ---------------------------------------------------------------------------
+
+def u_shape_profile(idx: int, total: int) -> int:
+    """Higher precision at start and end of the model."""
+    if idx < total * 0.15 or idx > total * 0.85:
+        return 4
+    return 3
+
+def sink_aware_profile(idx: int, total: int) -> int:
+    """Higher precision only for initial layers (attention sinks)."""
+    if idx < 4:
+        return 4
+    return 3
+
+def aggressive_profile(idx: int, total: int) -> int:
+    """Extreme compression (2-bit) for middle layers."""
+    if idx < total * 0.1: return 4
+    if idx > total * 0.9: return 3
+    return 2
+
+PRESETS = {
+    "u_shape": u_shape_profile,
+    "sink_aware": sink_aware_profile,
+    "aggressive": aggressive_profile,
+}
+
+
 def install_hooks(
     model_runner,
-    key_bits: int = 3,
+    key_bits: int | list[int] | Callable[[int, int], int] = 3,
     value_bits: int = 2,
     value_group_size: int = 32,
     ring_capacity: int = 128,
@@ -355,15 +384,18 @@ def install_hooks(
     global _GLOBAL_MODE
     _GLOBAL_MODE = mode
 
-    if initial_layers_key_bits is None:
-        initial_layers_key_bits = min(key_bits + 1, 4)
-
     static_ctx = model_runner.compilation_config.static_forward_context
     device = model_runner.device
 
     layer_states: dict[str, LayerState] = {}
-    layer_idx = 0
+    
+    # First pass: count total layers for dynamic bit allocation
+    total_tq_layers = 0
+    for layer_name, attn_module in static_ctx.items():
+        if hasattr(attn_module, "impl") and hasattr(attn_module.impl, "num_kv_heads"):
+            total_tq_layers += 1
 
+    layer_idx = 0
     for layer_name, attn_module in static_ctx.items():
         if not hasattr(attn_module, "impl"):
             continue
@@ -380,7 +412,17 @@ def install_hooks(
         else:
             continue
 
-        bits = initial_layers_key_bits if layer_idx < initial_layers_count else key_bits
+        # Dynamic bit allocation logic
+        if callable(key_bits):
+            bits = key_bits(layer_idx, total_tq_layers)
+        elif isinstance(key_bits, list):
+            bits = key_bits[layer_idx % len(key_bits)]
+        else:
+            # Legacy/default threshold logic
+            if initial_layers_key_bits is None:
+                initial_layers_key_bits = min(key_bits + 1, 4)
+            bits = initial_layers_key_bits if layer_idx < initial_layers_count else key_bits
+
         backend_kind = "mla" if _is_mla_impl(impl) else "flash"
         num_query_heads = _infer_num_query_heads(attn_module, impl)
 

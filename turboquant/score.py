@@ -21,6 +21,12 @@ from turboquant.store import FlatCache, CompressedKVStore
 from turboquant.kv_cache import dequantize_values
 from turboquant.quantizer import TurboQuantProd
 
+try:
+    from turboquant.triton_kernels import turboquant_fused_decode
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 logger = logging.getLogger("turboquant.score")
 
 MIN_HISTORY_FOR_TQ = 16
@@ -64,9 +70,11 @@ def compute_hybrid_attention(
 
     gqa_ratio = num_query_heads // num_kv_heads
 
+    # If we have only one segment, use specialized path
     if has_history and not has_recent:
         return _attend_compressed_only(
-            query, flat, store.quantizer, gqa_ratio, num_kv_heads, scale
+            query, flat, store.quantizer, gqa_ratio, num_kv_heads, scale,
+            store.value_group_size
         )
 
     if not has_history and has_recent:
@@ -74,10 +82,11 @@ def compute_hybrid_attention(
             query, recent_k, recent_v, gqa_ratio, num_kv_heads, scale
         )
 
-    # Both segments present — merge via log-sum-exp trick
-    return _attend_hybrid(
+    # Both segments present — merge via online-softmax style aggregation
+    # to avoid materializing the full history in FP32.
+    return _attend_hybrid_fused(
         query, flat, store.quantizer, recent_k, recent_v,
-        gqa_ratio, num_kv_heads, head_dim, scale,
+        gqa_ratio, num_kv_heads, head_dim, scale, store.value_group_size
     )
 
 
@@ -88,30 +97,36 @@ def _attend_compressed_only(
     gqa_ratio: int,
     num_kv_heads: int,
     scale: float,
+    value_group_size: int = 32,
 ) -> torch.Tensor:
-    """Attention over compressed history only (PyTorch path)."""
+    """Attention over compressed history only. Prefers Triton if available."""
+    T, Q, D = query.shape
+    
+    # Triton path — the paper's fast path
+    if HAS_TRITON and T == 1 and gqa_ratio == 1:
+        # Currently fused kernel is optimized for MHA (gqa_ratio=1)
+        # and single-token decode (T=1).
+        return turboquant_fused_decode(
+            query=query,
+            quantized_key=flat.prod_q,
+            value_quantized=flat.value_q,
+            Pi=quantizer.mse_quantizer.Pi,
+            S=quantizer.S,
+            centroids=quantizer.mse_quantizer.centroids,
+            mse_bits=flat.prod_q.mse_bits,
+            qjl_scale=quantizer.qjl_scale,
+            sm_scale=scale,
+            group_size=value_group_size,
+        ).unsqueeze(0)
+
+    # PyTorch fallback path
     k_dequant = quantizer.dequantize(flat.prod_q)  # (H_kv, N, D)
-    v_dequant = dequantize_values(flat.value_q, 32)
+    v_dequant = dequantize_values(flat.value_q, value_group_size)
 
     return _matmul_attend(query, k_dequant, v_dequant, gqa_ratio, num_kv_heads, scale)
 
 
-def _attend_exact_only(
-    query: torch.Tensor,
-    recent_k: torch.Tensor,
-    recent_v: torch.Tensor,
-    gqa_ratio: int,
-    num_kv_heads: int,
-    scale: float,
-) -> torch.Tensor:
-    """Attention over exact recent buffer only."""
-    return _matmul_attend(
-        query, recent_k.transpose(0, 1), recent_v.transpose(0, 1),
-        gqa_ratio, num_kv_heads, scale,
-    )
-
-
-def _attend_hybrid(
+def _attend_hybrid_fused(
     query: torch.Tensor,
     flat: FlatCache,
     quantizer: TurboQuantProd,
@@ -121,18 +136,79 @@ def _attend_hybrid(
     num_kv_heads: int,
     head_dim: int,
     scale: float,
+    value_group_size: int = 32,
 ) -> torch.Tensor:
-    """Merge compressed history + exact recent via concatenated attention."""
-    k_hist = quantizer.dequantize(flat.prod_q)  # (H_kv, N_hist, D)
-    v_hist = dequantize_values(flat.value_q, 32)
+    """Merge history + recent segments without full history materialization."""
+    T, Q, D = query.shape
+    
+    # Path A: Compressed History
+    # We need the max logit (m) and sum of exponentials (l) to merge
+    if HAS_TRITON and T == 1 and gqa_ratio == 1:
+        # Use Triton kernels for history (unbiased score estimation)
+        from turboquant.triton_kernels import turboquant_attention_score
+        hist_logits = turboquant_attention_score(
+            query=query,
+            quantized_key=flat.prod_q,
+            Pi=quantizer.mse_quantizer.Pi,
+            S=quantizer.S,
+            centroids=quantizer.mse_quantizer.centroids,
+            mse_bits=flat.prod_q.mse_bits,
+            qjl_scale=quantizer.qjl_scale,
+        ) * scale # (BH, N_hist)
+        
+        hist_m = hist_logits.max(dim=-1, keepdim=True).values
+        hist_p = torch.exp(hist_logits - hist_m)
+        hist_l = hist_p.sum(dim=-1, keepdim=True)
+        
+        v_hist = dequantize_values(flat.value_q, value_group_size) # (H, N, D)
+        # Weighted sum: (H, 1, N) @ (H, N, D) -> (H, 1, D)
+        hist_out = torch.matmul(hist_p.unsqueeze(1), v_hist).squeeze(1)
+    else:
+        # Fallback for GQA/Prefill
+        k_hist = quantizer.dequantize(flat.prod_q)
+        v_hist = dequantize_values(flat.value_q, value_group_size)
+        
+        # q: (H, G, T, D), k: (H, 1, N, D) -> scores: (H, G, T, N)
+        q_gqa = query.float().view(T, num_kv_heads, gqa_ratio, D).permute(1, 2, 0, 3)
+        hist_logits = torch.einsum("hgtd,hgnd->hgtn", q_gqa, k_hist.unsqueeze(1)) * scale
+        
+        hist_m = hist_logits.max(dim=-1, keepdim=True).values
+        hist_p = torch.exp(hist_logits - hist_m)
+        hist_l = hist_p.sum(dim=-1, keepdim=True)
+        hist_out = torch.einsum("hgtn,hgnd->hgtd", hist_p, v_hist.unsqueeze(1))
 
-    k_recent = recent_k.transpose(0, 1)   # (H_kv, N_recent, D)
+    # Path B: Recent Buffer (Exact)
+    k_recent = recent_k.transpose(0, 1) # (H, N_rec, D)
     v_recent = recent_v.transpose(0, 1)
+    
+    if T == 1 and gqa_ratio == 1:
+        # q: (BH, D), k: (H, N, D) -> (H, 1, N)
+        q_flat = query.view(num_kv_heads, 1, head_dim)
+        rec_logits = torch.matmul(q_flat, k_recent.transpose(-1, -2)) * scale
+        rec_m = rec_logits.max(dim=-1, keepdim=True).values
+        rec_p = torch.exp(rec_logits - rec_m)
+        rec_l = rec_p.sum(dim=-1, keepdim=True)
+        rec_out = torch.matmul(rec_p, v_recent)
+    else:
+        q_gqa = query.float().view(T, num_kv_heads, gqa_ratio, D).permute(1, 2, 0, 3)
+        rec_logits = torch.einsum("hgtd,hgnd->hgtn", q_gqa, k_recent.unsqueeze(1)) * scale
+        rec_m = rec_logits.max(dim=-1, keepdim=True).values
+        rec_p = torch.exp(rec_logits - rec_m)
+        rec_l = rec_p.sum(dim=-1, keepdim=True)
+        rec_out = torch.einsum("hgtn,hgnd->hgtd", rec_p, v_recent.unsqueeze(1))
 
-    k_all = torch.cat([k_hist.float(), k_recent.float()], dim=1)
-    v_all = torch.cat([v_hist.float(), v_recent.float()], dim=1)
-
-    return _matmul_attend(query, k_all, v_all, gqa_ratio, num_kv_heads, scale)
+    # Merge contributions via online softmax logic
+    # out = (hist_out * exp(m_hist - m_max) + rec_out * exp(m_rec - m_max)) / (l_hist * exp(m_hist - m_max) + l_rec * exp(m_rec - m_max))
+    m_max = torch.maximum(hist_m, rec_m)
+    alpha_hist = torch.exp(hist_m - m_max)
+    alpha_rec = torch.exp(rec_m - m_max)
+    
+    combined_l = hist_l * alpha_hist + rec_l * alpha_rec
+    combined_out = (hist_out * alpha_hist + rec_out * alpha_rec) / combined_l
+    
+    if T == 1 and gqa_ratio == 1:
+        return combined_out.view(T, Q, D).to(query.dtype)
+    return combined_out.permute(2, 0, 1, 3).reshape(T, Q, D).to(query.dtype)
 
 
 def _matmul_attend(

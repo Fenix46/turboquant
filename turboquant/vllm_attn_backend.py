@@ -39,9 +39,11 @@ def get_mode() -> str:
     return _GLOBAL_MODE
 
 
+from typing import Optional, Callable, Any
+
 def install_turboquant_hooks(
     model_runner,
-    key_bits: int = 3,
+    key_bits: int | list[int] | Callable[[int, int], int] = 3,
     value_bits: int = 2,
     value_group_size: int = 32,
     buffer_size: int = 128,

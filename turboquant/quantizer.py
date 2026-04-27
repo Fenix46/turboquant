@@ -41,8 +41,8 @@ def _pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
 
     For bits=1: 8 values per byte
     For bits=2: 4 values per byte
-    For bits=3: stored as 4-bit (2 per byte) for simplicity
     For bits=4: 2 values per byte
+    For bits=8: 1 value per byte (identity)
     """
     d = indices.shape[-1]
     batch_shape = indices.shape[:-1]
@@ -54,8 +54,10 @@ def _pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
     elif bits <= 4:
         vals_per_byte = 2
         bits = 4  # round up to 4-bit packing
+    elif bits <= 8:
+        vals_per_byte = 1
+        bits = 8
     else:
-        # Just store as uint8
         return indices.to(torch.uint8)
 
     # Pad to multiple of vals_per_byte
@@ -80,6 +82,9 @@ def _unpack_indices(packed: torch.Tensor, bits: int, d: int) -> torch.Tensor:
     elif bits <= 4:
         vals_per_byte = 2
         bits = 4
+    elif bits <= 8:
+        vals_per_byte = 1
+        bits = 8
     else:
         return packed.long()
 
